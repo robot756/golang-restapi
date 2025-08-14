@@ -15,12 +15,14 @@ jobs:
       DEPLOY_DIRECTORY: /root/apps/url-shortener
       CONFIG_PATH: /root/apps/url-shortener/config/prod.yaml
       ENV_FILE_PATH: /root/apps/url-shortener/config.env
+      SSH_OPTS: "-o ConnectTimeout=30 -o StrictHostKeyChecking=no -o LogLevel=ERROR"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0  # Для получения всей истории тегов
 
       - name: Verify tag exists
         run: |
@@ -33,49 +35,69 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21'  # Актуальная версия Go
+          go-version: '1.21'
 
       - name: Build app
         run: |
           go mod download
-          go build -o url-shortener ./cmd/url-shortener
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o url-shortener ./cmd/url-shortener
 
-      - name: Prepare SSH connection
+      - name: Prepare SSH
         run: |
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > deploy_key.pem
           chmod 600 deploy_key.pem
           mkdir -p ~/.ssh
           echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-      - name: Test SSH connection
-        run: ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "echo 'SSH connection successful!'"
-
-      - name: Deploy application
+      - name: Network diagnostics
         run: |
-          # Create directory structure
-          ssh -i deploy_key.pem ${{ env.HOST }} "\
-            mkdir -p ${{ env.DEPLOY_DIRECTORY }} && \
-            mkdir -p $(dirname ${{ env.CONFIG_PATH }})"
+          echo "=== Network Check ==="
+          echo "Ping test:"
+          ping -c 4 ${HOST#*@} || echo "Ping failed"
           
-          # Copy files
-          rsync -avz -e 'ssh -i deploy_key.pem' \
-            --exclude='.git' \
-            --exclude='.github' \
+          echo "Port check:"
+          timeout 5 bash -c "echo >/dev/tcp/${HOST#*@}/22" && \
+            echo "Port 22 is open" || echo "Port 22 is closed"
+          
+          echo "DNS resolution:"
+          nslookup ${HOST#*@} || echo "DNS lookup failed"
+
+      - name: Test SSH connection
+        run: |
+          ssh -i deploy_key.pem ${{ env.SSH_OPTS }} ${{ env.HOST }} \
+            "echo 'SSH connection established successfully'"
+
+      - name: Deploy artifacts
+        run: |
+          # Create required directories
+          ssh -i deploy_key.pem ${{ env.SSH_OPTS }} ${{ env.HOST }} \
+            "mkdir -p ${{ env.DEPLOY_DIRECTORY}} && \
+             mkdir -p $(dirname ${{ env.CONFIG_PATH }})"
+          
+          # Copy files with progress
+          rsync -avz --progress -e "ssh -i deploy_key.pem ${{ env.SSH_OPTS }}" \
+            --exclude={.git,.github,.DS_Store} \
             ./ ${{ env.HOST}}:${{ env.DEPLOY_DIRECTORY}}
+
+      - name: Setup service environment
+        run: |
+          ssh -i deploy_key.pem ${{ env.SSH_OPTS }} ${{ env.HOST }} <<EOF
+            touch ${{ env.ENV_FILE_PATH }}
+            chmod 600 ${{ env.ENV_FILE_PATH }}
+            echo 'CONFIG_PATH=${{ env.CONFIG_PATH }}' > ${{ env.ENV_FILE_PATH }}
+            echo 'HTTP_SERVER_PASSWORD=${{ secrets.AUTH_PASS }}' >> ${{ env.ENV_FILE_PATH }}
+          EOF
+
+      - name: Deploy and start service
+        run: |
+          scp -i deploy_key.pem ${{ env.SSH_OPTS }} \
+            ./deployment/url-shortener.service \
+            ${{ env.HOST}}:/etc/systemd/system/
           
-          # Setup environment
-          ssh -i deploy_key.pem ${{ env.HOST }} "\
-            touch ${{ env.ENV_FILE_PATH }} && \
-            chmod 600 ${{ env.ENV_FILE_PATH }} && \
-            echo 'CONFIG_PATH=${{ env.CONFIG_PATH }}' > ${{ env.ENV_FILE_PATH }} && \
-            echo 'HTTP_SERVER_PASSWORD=${{ secrets.AUTH_PASS }}' >> ${{ env.ENV_FILE_PATH }}"
-          
-          # Deploy systemd service
-          scp -i deploy_key.pem ./deployment/url-shortener.service ${{ env.HOST}}:/etc/systemd/system/
-          
-          # Enable and start service
-          ssh -i deploy_key.pem ${{ env.HOST }} "\
-            systemctl daemon-reload && \
-            systemctl enable url-shortener.service && \
-            systemctl restart url-shortener.service && \
-            systemctl status url-shortener.service"
+          ssh -i deploy_key.pem ${{ env.SSH_OPTS }} ${{ env.HOST }} <<EOF
+            systemctl daemon-reload
+            systemctl enable url-shortener.service
+            systemctl restart url-shortener.service
+            sleep 3
+            systemctl status url-shortener.service --no-pager
+          EOF
